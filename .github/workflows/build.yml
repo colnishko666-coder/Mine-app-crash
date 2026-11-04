@@ -1,0 +1,1004 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Create project
+        run: |
+          mkdir -p app/src/main/java/com/example/dash app/src/main/res/drawable
+          cat > app/src/main/java/com/example/dash/MainActivity.kt <<'EOT'
+          package com.example.dash
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.bluetooth.BluetoothManager
+          import android.bluetooth.BluetoothSocket
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.graphics.*
+          import android.os.Bundle
+          import android.view.GestureDetector
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowInsets
+          import android.view.WindowInsetsController
+          import android.view.WindowManager
+          import java.io.IOException
+          import java.io.InputStream
+          import java.io.OutputStream
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import java.util.UUID
+          import kotlin.math.abs
+          import kotlin.math.cos
+          import kotlin.math.ln
+          import kotlin.math.min
+          import kotlin.math.roundToInt
+          import kotlin.math.sin
+
+          private val SPP: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+
+          // Обороты на 1 км/ч для каждой передачи (колесо 175/70R13, ГП 4.3, 5-ступенчатая КПП).
+          // Если передача определяется неверно, подправьте числа под свою машину.
+          private val GEARS = floatArrayOf(138f, 79f, 51f, 37.7f, 31f)
+
+          class MainActivity : Activity() {
+              private lateinit var dash: DashView
+              private var socket: BluetoothSocket? = null
+              @Volatile private var running = false
+              @Volatile private var session = 0
+              private val prefs by lazy { getSharedPreferences("dash", MODE_PRIVATE) }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  window.setDecorFitsSystemWindows(false)
+                  window.insetsController?.let {
+                      it.hide(WindowInsets.Type.systemBars())
+                      it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                  }
+                  dash = DashView(this)
+                  dash.trip = prefs.getFloat("trip", 0f)
+                  setContentView(dash)
+
+                  // Долгое нажатие: режим HUD. Двойное нажатие: выбрать другой адаптер.
+                  val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+                      override fun onDown(e: MotionEvent) = true
+                      override fun onLongPress(e: MotionEvent) { dash.scaleX = -dash.scaleX }
+                      override fun onDoubleTap(e: MotionEvent): Boolean { chooseAndStart(); return true }
+                  })
+                  dash.setOnTouchListener { _, e -> gd.onTouchEvent(e); true }
+
+                  if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED)
+                      requestPermissions(arrayOf(Manifest.permission.BLUETOOTH_CONNECT), 1)
+                  else begin()
+              }
+
+              override fun onRequestPermissionsResult(c: Int, p: Array<out String>, r: IntArray) {
+                  if (r.isNotEmpty() && r[0] == PackageManager.PERMISSION_GRANTED) begin()
+                  else { dash.status = "Разрешите «Устройства поблизости» в настройках приложения"; dash.postInvalidate() }
+              }
+
+              private fun begin() {
+                  val addr = prefs.getString("addr", null)
+                  val proto = prefs.getString("proto", null)
+                  if (addr != null && proto != null) connectLoop(addr, proto) else chooseAndStart()
+              }
+
+              private fun chooseAndStart() {
+                  val devs = getSystemService(BluetoothManager::class.java).adapter.bondedDevices.toList()
+                  if (devs.isEmpty()) {
+                      dash.status = "Сначала спарьте адаптер в настройках Bluetooth (PIN 1234 или 0000)"
+                      dash.postInvalidate(); return
+                  }
+                  AlertDialog.Builder(this).setTitle("Адаптер")
+                      .setItems(devs.map { it.name ?: it.address }.toTypedArray()) { _, i ->
+                          val names = arrayOf("Авто (0)", "ISO 9141-2 (3)", "KWP 5 baud (4)", "KWP fast (5)")
+                          val codes = arrayOf("0", "3", "4", "5")
+                          AlertDialog.Builder(this).setTitle("Протокол (как в Car Scanner)")
+                              .setItems(names) { _, j ->
+                                  prefs.edit().putString("addr", devs[i].address).putString("proto", codes[j]).apply()
+                                  connectLoop(devs[i].address, codes[j])
+                              }.show()
+                      }.show()
+              }
+
+              private fun connectLoop(addr: String, proto: String) {
+                  try { socket?.close() } catch (_: Exception) {}
+                  val my = ++session
+                  running = true
+                  Thread {
+                      while (running && my == session) {
+                          try {
+                              dash.status = "Подключение..."; dash.postInvalidate()
+                              val ad = getSystemService(BluetoothManager::class.java).adapter
+                              ad.cancelDiscovery()
+                              val s = ad.getRemoteDevice(addr).createRfcommSocketToServiceRecord(SPP)
+                              s.connect(); socket = s
+                              val inp = s.inputStream; val out = s.outputStream
+                              for (c in listOf("ATZ", "ATE0", "ATL0", "ATH0", "ATS0", "ATSP$proto")) cmd(inp, out, c)
+                              cmd(inp, out, "0100")
+                              dash.status = ""
+                              poll(inp, out, my)
+                          } catch (e: Exception) {
+                              dash.status = "Нет связи, повтор..."; dash.postInvalidate()
+                          }
+                          try { socket?.close() } catch (_: Exception) {}
+                          try { Thread.sleep(3000) } catch (_: InterruptedException) {}
+                      }
+                  }.start()
+              }
+
+              private fun poll(inp: InputStream, out: OutputStream, my: Int) {
+                  var sum = 0L; var n = 0L; var loop = 0; var noData = 0
+                  val fails = IntArray(3)
+                  var last = System.nanoTime()
+                  while (running && my == session) {
+                      val v = pid(inp, out, "010D", 2)
+                      val r = pid(inp, out, "010C", 4)
+                      if (v == null && r == null) { if (++noData >= 5) throw IOException("нет ответа ЭБУ") } else noData = 0
+                      v?.let {
+                          dash.speed = it
+                          if (it > dash.maxSpeed) dash.maxSpeed = it
+                          if (it > 0) { sum += it; n++; dash.avg = sum.toFloat() / n }
+                      }
+                      r?.let { dash.rpm = it / 4 }
+                      if (loop % 10 == 0) {
+                          if (fails[0] < 3) pid(inp, out, "0105", 2)?.let { dash.temp = it - 40 } ?: fails[0]++
+                          if (fails[1] < 3) pid(inp, out, "010F", 2)?.let { dash.outTemp = it - 40 } ?: fails[1]++
+                          if (fails[2] < 3) pid(inp, out, "012F", 2)?.let { dash.fuel = it / 255f } ?: fails[2]++
+                      }
+                      val now = System.nanoTime()
+                      dash.trip += dash.speed * ((now - last) / 1e9f) / 3600f
+                      last = now
+                      dash.gear = guessGear(dash.speed, dash.rpm)
+                      dash.postInvalidate()
+                      loop++
+                  }
+              }
+
+              private fun guessGear(v: Int, rpm: Int): Int {
+                  if (v < 3) return 0
+                  val ratio = rpm / v.toFloat()
+                  var best = 1; var bd = Float.MAX_VALUE
+                  GEARS.forEachIndexed { i, k -> val d = abs(ln(ratio / k)); if (d < bd) { bd = d; best = i + 1 } }
+                  return best
+              }
+
+              private fun cmd(inp: InputStream, out: OutputStream, s: String): String {
+                  out.write((s + "\r").toByteArray()); out.flush()
+                  val sb = StringBuilder()
+                  while (true) {
+                      val c = inp.read()
+                      if (c < 0 || c == '>'.code) break
+                      sb.append(c.toChar())
+                  }
+                  return sb.toString()
+              }
+
+              private fun pid(inp: InputStream, out: OutputStream, q: String, hexLen: Int): Int? {
+                  val r = cmd(inp, out, q).replace("SEARCHING...", "").replace(Regex("\\s"), "").uppercase()
+                  val key = "41" + q.substring(2)
+                  val i = r.indexOf(key)
+                  if (i < 0 || r.length < i + key.length + hexLen) return null
+                  return r.substring(i + key.length, i + key.length + hexLen).toIntOrNull(16)
+              }
+
+              override fun onPause() {
+                  prefs.edit().putFloat("trip", dash.trip).apply()
+                  super.onPause()
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  try { socket?.close() } catch (_: Exception) {}
+                  super.onDestroy()
+              }
+          }
+
+          /* ======================  ПАНЕЛЬ  ====================== */
+
+          private const val DW = 1916f
+          private const val DH = 821f
+
+          private class Dial(
+              val cx: Float, val cy: Float, val max: Float, val major: Float, val minor: Float,
+              val sub: Float, val label: Float, val tail: Float, stops: List<Pair<Float, String>>
+          ) {
+              private val colors = IntArray(stops.size + 1)
+              private val pos = FloatArray(stops.size + 1)
+              val rect = RectF(cx - 232, cy - 232, cx + 232, cy + 232)
+              val rectOuter = RectF(cx - 252, cy - 252, cx + 252, cy + 252)
+              init {
+                  val k = 255f / 360f
+                  stops.forEachIndexed { i, (p, c) -> colors[i] = Color.parseColor(c); pos[i] = p * k }
+                  colors[stops.size] = colors[stops.size - 1]; pos[stops.size] = 1f
+              }
+              val shader: Shader by lazy {
+                  SweepGradient(cx, cy, colors, pos).also { s -> s.setLocalMatrix(Matrix().apply { postRotate(135f, cx, cy) }) }
+              }
+              fun ang(v: Float) = Math.toRadians(135.0 + 255.0 * v / max).toFloat()
+          }
+
+          class DashView(ctx: Context) : View(ctx) {
+              @Volatile var speed = 0
+              @Volatile var rpm = 0
+              @Volatile var temp = 0
+              @Volatile var maxSpeed = 0
+              @Volatile var avg = 0f
+              @Volatile var trip = 0f
+              @Volatile var gear = 0
+              @Volatile var outTemp: Int? = null
+              @Volatile var fuel = -1f
+              @Volatile var status = "Выберите адаптер"
+
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val tM = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+              private val tMI = Typeface.create("sans-serif-medium", Typeface.ITALIC)
+              private val tB = Typeface.create("sans-serif", Typeface.BOLD)
+              private val tBI = Typeface.create("sans-serif", Typeface.BOLD_ITALIC)
+              private val tRI = Typeface.create("sans-serif", Typeface.ITALIC)
+
+              private val cDim = Color.parseColor("#7FA2BD")
+              private val cLight = Color.parseColor("#D7ECFF")
+              private val cWhite = Color.parseColor("#F2FBFF")
+              private val cCy = Color.parseColor("#27B6FF")
+              private val cOr = Color.parseColor("#FF8A2A")
+              private val cHot = Color.parseColor("#FFB066")
+              private val cLabel = Color.parseColor("#4FC3F7")
+              private val cLabel2 = Color.parseColor("#8FD3FF")
+              private val cNeedle = Color.parseColor("#BFEAFF")
+
+              private val spd = Dial(342f, 398f, 220f, 20f, 10f, 5f, 20f, .82f,
+                  listOf(0f to "#1C7BFF", .35f to "#27B6FF", .6f to "#8FE8FF", .72f to "#DFF6FF", .82f to "#FFC44A", 1f to "#FF8A1F"))
+              private val rpmD = Dial(1612f, 398f, 8f, 1f, .5f, .25f, 1f, .75f,
+                  listOf(0f to "#1C7BFF", .3f to "#27B6FF", .55f to "#9BEBFF", .7f to "#F4FBFF", .76f to "#FFB13B", 1f to "#FF3B2A"))
+
+              private val fuelCols = intArrayOf("#FFB23E", "#27A9FF", "#35B8FF", "#4CC9FF", "#7FDCFF", "#A8E8FF").map { Color.parseColor(it) }.toIntArray()
+              private val coolCols = intArrayOf("#1EA0FF", "#27B6FF", "#4CC9FF", "#7FDCFF", "#FF8A2A", "#FF3B2A").map { Color.parseColor(it) }.toIntArray()
+              private val unlit = Color.argb(72, 70, 110, 150)
+
+              private val car: Bitmap? by lazy {
+                  try {
+                      val src = BitmapFactory.decodeResource(resources, R.drawable.car, BitmapFactory.Options().apply { inScaled = false })
+                      val out = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
+                      val cc = Canvas(out); cc.drawBitmap(src, 0f, 0f, null)
+                      val mp = Paint(); mp.xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
+                      mp.shader = RadialGradient(0f, 0f, 1f, intArrayOf(Color.BLACK, Color.BLACK, Color.TRANSPARENT), floatArrayOf(0f, .68f, 1f), Shader.TileMode.CLAMP)
+                      cc.save(); cc.translate(src.width / 2f, src.height / 2f); cc.scale(src.width / 2f, src.height / 2f)
+                      cc.drawRect(-1f, -1f, 1f, 1f, mp); cc.restore()
+                      out
+                  } catch (e: Exception) { null }
+              }
+
+              private var staticBmp: Bitmap? = null
+              private var sc = 1f; private var ox = 0f; private var oy = 0f
+              private var t0 = 0L
+              private val timeFmt = SimpleDateFormat("HH:mm", Locale.getDefault())
+              private val path = Path()
+
+              private fun pt(color: Int, w: Float = 0f): Paint {
+                  p.reset(); p.isAntiAlias = true; p.color = color
+                  if (w > 0f) { p.style = Paint.Style.STROKE; p.strokeWidth = w; p.strokeCap = Paint.Cap.ROUND; p.strokeJoin = Paint.Join.ROUND }
+                  return p
+              }
+              private fun tx(c: Canvas, s: String, x: Float, y: Float, size: Float, color: Int, tf: Typeface = tM, al: Paint.Align = Paint.Align.LEFT) {
+                  p.reset(); p.isAntiAlias = true; p.color = color; p.textSize = size; p.typeface = tf; p.textAlign = al
+                  c.drawText(s, x, y, p)
+              }
+              private fun tw(s: String, size: Float, tf: Typeface): Float {
+                  p.reset(); p.textSize = size; p.typeface = tf; return p.measureText(s)
+              }
+
+              override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
+                  if (w <= 0 || h <= 0) return
+                  sc = min(w / DW, h / DH); ox = (w - DW * sc) / 2f; oy = (h - DH * sc) / 2f
+                  val bmp = Bitmap.createBitmap((DW * sc).toInt().coerceAtLeast(1), (DH * sc).toInt().coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+                  val c = Canvas(bmp); c.scale(sc, sc)
+                  drawStatic(c); staticBmp = bmp
+              }
+
+              /* ---------- статическая часть ---------- */
+              private fun dialStatic(c: Canvas, d: Dial) {
+                  c.drawArc(d.rectOuter, 135f - 2.3f, 255f + 4.6f, false, pt(Color.argb(56, 39, 182, 255), 2f))
+                  val tr = pt(Color.WHITE, 7f); tr.shader = d.shader; tr.alpha = 102
+                  c.drawArc(d.rect, 135f, 255f, false, tr)
+
+                  val n = (d.max / d.sub).roundToInt()
+                  fun isK(v: Float, q: Float) = abs(v / q - (v / q).roundToInt()) < 1e-4
+                  for (i in 0..n) {
+                      val v = i * d.sub; val a = d.ang(v); val co = cos(a); val si = sin(a); val ro = 222f
+                      val len: Float; val w: Float; var col: Int
+                      if (isK(v, d.major)) { len = 18f; w = 2.6f; col = cLight }
+                      else if (isK(v, d.minor)) { len = 11f; w = 2f; col = Color.parseColor("#6AA7D6") }
+                      else { len = 6f; w = 1.4f; col = Color.parseColor("#3D6A91") }
+                      if (v / d.max >= d.tail) col = Color.parseColor("#FFA23A")
+                      c.drawLine(d.cx + co * ro, d.cy + si * ro, d.cx + co * (ro - len), d.cy + si * (ro - len), pt(col, w))
+                  }
+                  var v = 0f
+                  while (v <= d.max + 1e-4f) {
+                      val a = d.ang(v)
+                      tx(c, v.roundToInt().toString(), d.cx + cos(a) * 170f, d.cy + sin(a) * 170f + 9f, 26f, cLight, tMI, Paint.Align.CENTER)
+                      v += d.label
+                  }
+                  c.drawCircle(d.cx, d.cy, 112f, pt(Color.argb(235, 8, 16, 28)).also { it.style = Paint.Style.FILL })
+                  c.drawCircle(d.cx, d.cy, 112f, pt(Color.argb(77, 60, 130, 190), 2f))
+              }
+
+              private fun icoTherm(c: Canvas, cx: Float, cy: Float, col: Int, big: Boolean) {
+                  val q = pt(col, 3f)
+                  c.drawLine(cx, cy - 22, cx, cy + 6, q); c.drawCircle(cx, cy + 13, 7f, pt(col, 3f))
+                  for (d in floatArrayOf(-14f, -6f)) c.drawLine(cx + 5, cy + d, cx + 12, cy + d, pt(col, 3f))
+                  for (d in floatArrayOf(26f, 34f)) {
+                      path.reset(); path.moveTo(cx - 24, cy + d); path.quadTo(cx - 12, cy + d - 7, cx, cy + d); path.quadTo(cx + 12, cy + d + 7, cx + 24, cy + d)
+                      c.drawPath(path, pt(col, 3f))
+                  }
+              }
+              private fun icoGauge(c: Canvas, cx: Float, cy: Float) {
+                  c.drawCircle(cx, cy, 23f, pt(cLabel, 3f))
+                  c.drawLine(cx, cy + 4, cx + 11, cy - 10, pt(cLabel, 3f))
+                  c.drawCircle(cx, cy, 3f, pt(cLabel, 3f))
+                  c.drawArc(RectF(cx - 15, cy - 15, cx + 15, cy + 15), 144f, 252f, false, pt(cLabel, 2f))
+              }
+              private fun icoFuel(c: Canvas, cx: Float, cy: Float, col: Int) {
+                  c.drawRoundRect(cx - 14, cy - 20, cx + 6, cy + 20, 3f, 3f, pt(col, 3f))
+                  c.drawRoundRect(cx - 9, cy - 14, cx + 1, cy - 3, 1f, 1f, pt(col, 3f))
+                  path.reset(); path.moveTo(cx + 6, cy - 6); path.lineTo(cx + 16, cy - 6); path.lineTo(cx + 16, cy + 10)
+                  c.drawPath(path, pt(col, 3f))
+              }
+
+              private fun drawStatic(c: Canvas) {
+                  val bg = pt(Color.WHITE).also {
+                      it.shader = RadialGradient(DW / 2, DH * .45f, DW * .62f, Color.parseColor("#0D1B2A"), Color.parseColor("#04070C"), Shader.TileMode.CLAMP)
+                  }
+                  c.drawRoundRect(0f, 0f, DW, DH, 34f, 34f, bg)
+                  dialStatic(c, spd); dialStatic(c, rpmD)
+                  car?.let { c.drawBitmap(it, 560f, 215f, null) }
+
+                  // верхняя плашка
+                  val pl = pt(Color.argb(140, 39, 182, 255), 2f); pl.setShadowLayer(10f, 0f, 0f, cCy)
+                  path.reset(); path.moveTo(527f, 128f); path.lineTo(527f, 150f); path.quadTo(540f, 184f, 575f, 184f)
+                  path.lineTo(1340f, 184f); path.quadTo(1378f, 184f, 1390f, 150f); path.lineTo(1390f, 128f)
+                  c.drawPath(path, pl)
+                  path.reset(); path.moveTo(722f, 180f); path.lineTo(742f, 158f); path.lineTo(818f, 158f); c.drawPath(path, pl)
+                  path.reset(); path.moveTo(1100f, 158f); path.lineTo(1170f, 158f); path.lineTo(1195f, 180f); c.drawPath(path, pl)
+
+                  // правая панель
+                  c.drawRoundRect(1170f, 242f, 1422f, 533f, 18f, 18f, pt(Color.argb(199, 10, 22, 36)).also { it.style = Paint.Style.FILL })
+                  c.drawRoundRect(1170f, 242f, 1422f, 533f, 18f, 18f, pt(Color.argb(115, 39, 182, 255), 2f))
+                  for (y in floatArrayOf(335f, 434f)) c.drawLine(1182f, y, 1410f, y, pt(Color.argb(64, 39, 182, 255), 1.5f))
+                  icoTherm(c, 1212f, 282f, cLabel, false); icoGauge(c, 1212f, 384f); icoGauge(c, 1212f, 484f)
+
+                  // нижняя панель
+                  c.drawRoundRect(70f, 582f, 1850f, 680f, 44f, 44f, pt(Color.argb(235, 8, 16, 28)).also { it.style = Paint.Style.FILL })
+                  val tl = pt(Color.WHITE, 2f)
+                  tl.shader = LinearGradient(70f, 0f, 1850f, 0f, intArrayOf(Color.argb(0, 39, 182, 255), Color.argb(204, 39, 182, 255), Color.argb(0, 39, 182, 255)), null, Shader.TileMode.CLAMP)
+                  c.drawLine(110f, 583f, 1810f, 583f, tl)
+                  icoFuel(c, 127f, 617f, Color.parseColor("#7FD0FF"))
+                  icoTherm(c, 1789f, 612f, Color.parseColor("#7FD0FF"), true)
+                  tx(c, "E", 178f, 634f, 22f, Color.parseColor("#FFB23E")); tx(c, "F", 433f, 634f, 22f, cLight)
+                  tx(c, "C", 1466f, 634f, 22f, cLight); tx(c, "H", 1725f, 634f, 22f, Color.parseColor("#FF5A3A"))
+                  tx(c, "ПУТЬ", 549f, 640f, 18f, cDim)
+              }
+
+              /* ---------- динамическая часть ---------- */
+              private fun dialDyn(c: Canvas, d: Dial, f: Float) {
+                  if (f > 0.003f) {
+                      val q = pt(Color.WHITE, 7f); q.shader = d.shader
+                      q.setShadowLayer(22f, 0f, 0f, if (f > d.tail) cOr else cCy)
+                      c.drawArc(d.rect, 135f, 255f * f, false, q)
+                  }
+                  val a = Math.toRadians(135.0 + 255.0 * f).toFloat()
+                  val n = pt(cNeedle, 5f); n.setShadowLayer(14f, 0f, 0f, cCy)
+                  c.drawLine(d.cx + cos(a) * 122f, d.cy + sin(a) * 122f, d.cx + cos(a) * 198f, d.cy + sin(a) * 198f, n)
+              }
+
+              private fun segs(c: Canvas, x0: Float, y0: Float, lit: Int, cols: IntArray) {
+                  for (i in 0 until 6) {
+                      val x = x0 + i * 37f
+                      val q = pt(if (i < lit) cols[i] else unlit).also { it.style = Paint.Style.FILL }
+                      if (i < lit) q.setShadowLayer(10f, 0f, 0f, cols[i])
+                      path.reset(); path.moveTo(x + 8, y0); path.lineTo(x + 38, y0); path.lineTo(x + 30, y0 + 14); path.lineTo(x, y0 + 14); path.close()
+                      c.drawPath(path, q)
+                  }
+              }
+
+              override fun onDraw(c: Canvas) {
+                  c.drawColor(Color.BLACK)
+                  staticBmp?.let { c.drawBitmap(it, ox, oy, null) } ?: return
+                  if (t0 == 0L) t0 = System.nanoTime()
+                  val t = (System.nanoTime() - t0) / 1e9f
+                  val booting = t < 2.8f
+                  c.save(); c.translate(ox, oy); c.scale(sc, sc)
+
+                  val fs: Float; val fr: Float
+                  if (booting) {
+                      val pr = t / 2.8f
+                      fun e(x: Float) = if (x < .5f) 4 * x * x * x else 1 - Math.pow((-2 * x + 2).toDouble(), 3.0).toFloat() / 2
+                      val v = if (pr < .5f) e(pr * 2) else 1 - e(pr * 2 - 1)
+                      fs = v; fr = v
+                  } else {
+                      fs = min(speed.toFloat(), spd.max) / spd.max
+                      fr = min(rpm.toFloat(), 8000f) / 8000f
+                  }
+                  dialDyn(c, spd, fs); dialDyn(c, rpmD, fr)
+
+                  val sp = speed; val hot = sp > 110
+                  tx(c, "КМ/Ч", spd.cx, 342f, 15f, cDim, tM, Paint.Align.CENTER)
+                  tx(c, sp.toString(), spd.cx, 432f, 96f, if (hot) cHot else cWhite, tBI, Paint.Align.CENTER)
+                  tx(c, "КМ/Ч", spd.cx, 466f, 20f, cLight, tM, Paint.Align.CENTER)
+                  tx(c, rpm.toString(), rpmD.cx, 410f, 66f, if (rpm > 6000) cHot else cWhite, tBI, Paint.Align.CENTER)
+                  tx(c, "об/мин", rpmD.cx, 442f, 20f, cLight, tM, Paint.Align.CENTER)
+
+                  tx(c, timeFmt.format(Date()), 635f, 168f, 30f, Color.parseColor("#E8F6FF"), tM, Paint.Align.CENTER)
+                  tx(c, "ВАЗ 2105", 958f, 161f, 32f, Color.WHITE, tB, Paint.Align.CENTER)
+                  val ot = outTemp
+                  tx(c, if (ot == null) "--°C" else (if (ot >= 0) "+$ot°C" else "$ot°C"), 1283f, 167f, 28f, Color.parseColor("#E8F6FF"), tM, Paint.Align.CENTER)
+
+                  // правая панель
+                  data class Row(val label: String, val value: String, val unit: String, val ly: Float, val vy: Float, val col: Int)
+                  val rows = listOf(
+                      Row("Температура ОЖ", temp.toString(), "°C", 271f, 312f, cLabel),
+                      Row("Максимум", maxSpeed.toString(), "км/ч", 367f, 412f, cLabel2),
+                      Row("Средняя", avg.roundToInt().toString(), "км/ч", 467f, 512f, cLabel2)
+                  )
+                  rows.forEach { r ->
+                      tx(c, r.label, 1264f, r.ly, 17f, r.col)
+                      tx(c, r.value, 1264f, r.vy, 36f, cWhite, tMI)
+                      tx(c, r.unit, 1264f + tw(r.value, 36f, tMI) + 8f, r.vy, 19f, cLight, tRI)
+                  }
+
+                  // низ
+                  val lf = if (fuel < 0) 0 else (fuel * 6).roundToInt()
+                  val tf = ((temp - 40) / 70f).coerceIn(0f, 1f)
+                  segs(c, 205f, 619f, lf, fuelCols)
+                  segs(c, 1498f, 619f, (tf * 6).roundToInt(), coolCols)
+                  val u1 = pt(Color.WHITE, 2f)
+                  u1.shader = LinearGradient(205f, 0f, 420f, 0f, intArrayOf(Color.argb(204, 255, 178, 62), Color.argb(204, 127, 220, 255), Color.argb(26, 127, 220, 255)), floatArrayOf(0f, .4f, 1f), Shader.TileMode.CLAMP)
+                  c.drawLine(205f, 642f, 420f, 642f, u1)
+                  val u2 = pt(Color.WHITE, 2f)
+                  u2.shader = LinearGradient(1498f, 0f, 1712f, 0f, intArrayOf(Color.argb(26, 127, 220, 255), Color.argb(204, 127, 220, 255), Color.argb(230, 255, 90, 58)), floatArrayOf(0f, .6f, 1f), Shader.TileMode.CLAMP)
+                  c.drawLine(1498f, 642f, 1712f, 642f, u2)
+
+                  val tripS = String.format(Locale.US, "%06.1f", trip)
+                  tx(c, tripS, 617f, 642f, 32f, cWhite, tMI)
+                  tx(c, "км", 617f + tw(tripS, 32f, tMI) + 10f, 642f, 18f, cLight, tRI)
+
+                  val gs = arrayOf("N", "1", "2", "3", "4", "5")
+                  gs.forEachIndexed { i, s ->
+                      val x = 868f + i * 50f; val on = gear == i
+                      if (on) {
+                          c.drawRoundRect(x - 24, 608f, x + 24, 654f, 8f, 8f, pt(Color.argb(36, 39, 182, 255)).also { it.style = Paint.Style.FILL })
+                          c.drawRoundRect(x - 24, 608f, x + 24, 654f, 8f, 8f, pt(cCy, 3f).also { it.setShadowLayer(12f, 0f, 0f, cCy) })
+                      }
+                      tx(c, s, x, 641f, 28f, if (on) Color.WHITE else cDim, if (on) tB else tM, Paint.Align.CENTER)
+                  }
+
+                  if (status.isNotEmpty()) tx(c, status, 958f, 236f, 22f, Color.parseColor("#FFD166"), tM, Paint.Align.CENTER)
+                  c.restore()
+                  if (booting) postInvalidateOnAnimation()
+              }
+          }
+          EOT
+          cat > app/src/main/AndroidManifest.xml <<'EOT'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+              <application
+                  android:label="Панель ВАЗ"
+                  android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="sensorLandscape"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOT
+          cat > car.b64 <<'EOT'
+          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
+          EOT
+          base64 -d car.b64 > app/src/main/res/drawable/car.jpg
+          cat > settings.gradle.kts <<'EOT'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "dash"
+          include(":app")
+          EOT
+          cat > build.gradle.kts <<'EOT'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOT
+          cat > app/build.gradle.kts <<'EOT'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.dash"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.dash"
+                  minSdk = 31
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOT
+          echo "org.gradle.jvmargs=-Xmx2g" > gradle.properties
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: panel-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
